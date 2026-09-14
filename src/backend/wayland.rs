@@ -16,8 +16,10 @@
 //! compositor-specific D-Bus/portal calls):
 //!   * GetActiveAppInfo / GetRunningApps — no portable protocol; returns empty.
 //!     KDE could be wired via KWin D-Bus and GNOME via a shell extension later.
-//!   * Held-modifier snapshot/release (the Windows helper's GetKeyState dance)
-//!     needs reading /dev/input; not done yet (TODO).
+//!   * Held-modifier neutralisation (the Windows helper's GetKeyState dance) is
+//!     not possible from a virtual device: a uinput keyboard cannot clear a key
+//!     held on a different device, and trying strands the modifier instead. See
+//!     `backend::uinput::UInput::chord`.
 //!   * Simultaneous text/plain + text/html clipboard offer (wl-copy sets one
 //!     payload); we offer plain text, which is what paste targets read (TODO).
 
@@ -116,8 +118,8 @@ impl Backend for WaylandBackend {
             .iter()
             .filter_map(|f| keymap::flag_to_evdev(f))
             .collect();
-        // TODO: snapshot & release physically-held modifiers around injection
-        // (mirrors the Windows helper's GetKeyState dance); needs /dev/input read.
+        // Modifiers the user is physically holding are deliberately left alone;
+        // a virtual device cannot release them. See `UInput::chord`.
         self.uinput.chord(key, &mods)
     }
 

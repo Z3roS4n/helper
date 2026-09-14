@@ -20,7 +20,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
 use super::Result;
-use crate::keymap;
 
 // --- evdev event types (<linux/input-event-codes.h>) ---
 const EV_SYN: u16 = 0x00;
@@ -153,84 +152,45 @@ impl UInput {
     /// bug, not the fix — verified: 0 ms → modifier applied, ≥8 ms → dropped.
     /// See docs/learnings/wayland-injection.md.
     ///
-    /// Mirrors the Windows helper's GetKeyState dance: any modifier the user is
-    /// *physically* holding at injection time is released first and restored
-    /// afterwards, so e.g. a held Ctrl doesn't turn our injected `v` into a
-    /// stray Ctrl+V (or our injected Ctrl+V into Ctrl+Shift+V). When
-    /// `/dev/input` isn't readable (no `input` group / uaccess ACL), the held
-    /// set is empty and this degrades to a plain chord — see [`held_modifiers`].
+    /// This deliberately does *not* try to neutralise modifiers the user is
+    /// physically holding. An earlier version mirrored the Windows helper's
+    /// GetKeyState dance — snapshot held modifiers across `/dev/input`, release
+    /// them, chord, re-press them — but a virtual device cannot clear a key held
+    /// on a *different* device, and the attempt strands modifiers permanently:
+    ///
+    /// * the release leg is silently swallowed. `input_handle_event()` drops an
+    ///   `EV_KEY` release whose key is not set in *this* device's `dev->key`
+    ///   bitmap, and the user's Ctrl is held on their keyboard, not on ours. The
+    ///   compositor never sees it.
+    /// * the restore leg is not. Pressing a key this device does not hold is a
+    ///   real transition, so the kernel sets the bit and forwards it — leaving
+    ///   our device holding Ctrl with nothing left to release it. `UInput` lives
+    ///   for the whole process, so `UI_DEV_DESTROY` never runs to flush it.
+    ///
+    /// Compositors OR modifier state across every keyboard on the seat, so one
+    /// stranded Ctrl rewrites every subsequent keybind on *all* keyboards until
+    /// the helper is killed. See the `chord_leaves_no_modifier_pressed` test.
     pub fn chord(&mut self, key: u16, mods: &[u16]) -> Result<()> {
-        let held = held_modifiers();
-        for &m in &held {
-            let _ = self.key(m, false);
-        }
-        for &m in mods {
-            self.key(m, true)?;
-        }
-        self.key(key, true)?;
-        self.key(key, false)?;
-        for &m in mods.iter().rev() {
-            self.key(m, false)?;
-        }
-        // Restore physically-held modifiers (reverse order). Best-effort.
-        for &m in held.iter().rev() {
-            let _ = self.key(m, true);
+        for (code, press) in chord_events(key, mods) {
+            self.key(code, press)?;
         }
         Ok(())
     }
 }
 
-/// Snapshot the modifier keys the user is *physically* holding right now, by
-/// querying every readable `/dev/input/event*` device with `EVIOCGKEY` (a
-/// bitmap of currently-pressed keycodes) and intersecting with the modifier set.
+/// The exact `(keycode, press)` sequence [`UInput::chord`] emits: modifiers down
+/// in order, the key tapped, modifiers up in reverse.
 ///
-/// Returns an empty list — and is therefore a no-op for `chord` — when no event
-/// device is readable. Reading `/dev/input` typically needs the `input` group
-/// or the logind `uaccess` ACL; on sessions without it, the snapshot is simply
-/// skipped (the common case at paste time has no modifier held anyway).
-pub fn held_modifiers() -> Vec<u16> {
-    use std::collections::BTreeSet;
-    // EVIOCGKEY(len) = _IOC(_IOC_READ=2, 'E'=0x45, 0x18, len). KEY_MAX=0x2ff ->
-    // a 96-byte bitmap covers every keycode we care about.
-    const BITMAP_LEN: usize = (KEY_MAX as usize / 8) + 1;
-    let req: libc::c_ulong =
-        ((2u64 << 30) | ((BITMAP_LEN as u64) << 16) | (0x45 << 8) | 0x18) as libc::c_ulong;
-
-    let dir = match std::fs::read_dir("/dev/input") {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-    let mut held = BTreeSet::new();
-    for entry in dir.flatten() {
-        let path = entry.path();
-        let is_event = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|n| n.starts_with("event"));
-        if !is_event {
-            continue;
-        }
-        let file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(_) => continue, // not readable -> skip this device
-        };
-        let mut bitmap = [0u8; BITMAP_LEN];
-        let r = unsafe { libc::ioctl(file.as_raw_fd(), req, bitmap.as_mut_ptr()) };
-        if r < 0 {
-            continue;
-        }
-        for &m in keymap::EVDEV_MODIFIERS {
-            let (byte, bit) = (m as usize / 8, m as u32 % 8);
-            if byte < bitmap.len() && (bitmap[byte] >> bit) & 1 == 1 {
-                held.insert(m);
-            }
-        }
-    }
-    held.into_iter().collect()
+/// Split out from the emitter so the invariant that matters can be asserted
+/// without a real `/dev/uinput`: the sequence must leave *no* key pressed. A
+/// chord that strands a modifier rewrites every later keybind on the seat.
+fn chord_events(key: u16, mods: &[u16]) -> Vec<(u16, bool)> {
+    let mut events = Vec::with_capacity(mods.len() * 2 + 2);
+    events.extend(mods.iter().map(|&m| (m, true)));
+    events.push((key, true));
+    events.push((key, false));
+    events.extend(mods.iter().rev().map(|&m| (m, false)));
+    events
 }
 
 impl Drop for UInput {
@@ -247,4 +207,52 @@ fn ioctl_set(fd: libc::c_int, req: libc::c_ulong, arg: libc::c_int) -> Result<()
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chord_events;
+    use std::collections::BTreeMap;
+
+    /// Net key state after the chord, i.e. presses that never got a release.
+    fn stranded(key: u16, mods: &[u16]) -> Vec<u16> {
+        let mut depth: BTreeMap<u16, i32> = BTreeMap::new();
+        for (code, press) in chord_events(key, mods) {
+            *depth.entry(code).or_default() += if press { 1 } else { -1 };
+        }
+        depth
+            .into_iter()
+            .filter(|&(_, d)| d != 0)
+            .map(|(code, _)| code)
+            .collect()
+    }
+
+    const KEY_V: u16 = 47;
+    const KEY_LEFTCTRL: u16 = 29;
+    const KEY_LEFTSHIFT: u16 = 42;
+
+    /// Regression guard. The helper's `UInput` lives for the whole process, so
+    /// `UI_DEV_DESTROY` never runs between chords to flush held keys: anything
+    /// this sequence leaves pressed stays pressed until the helper is killed,
+    /// and compositors OR modifier state across all keyboards on the seat.
+    #[test]
+    fn chord_leaves_no_modifier_pressed() {
+        assert!(stranded(KEY_V, &[KEY_LEFTCTRL]).is_empty());
+        assert!(stranded(KEY_V, &[KEY_LEFTCTRL, KEY_LEFTSHIFT]).is_empty());
+        assert!(stranded(KEY_V, &[]).is_empty());
+    }
+
+    #[test]
+    fn chord_holds_modifiers_across_the_key() {
+        let events = chord_events(KEY_V, &[KEY_LEFTCTRL]);
+        assert_eq!(
+            events,
+            vec![
+                (KEY_LEFTCTRL, true),
+                (KEY_V, true),
+                (KEY_V, false),
+                (KEY_LEFTCTRL, false),
+            ]
+        );
+    }
 }
