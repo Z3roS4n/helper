@@ -17,8 +17,9 @@
 //! pattern: a tiny GNOME Shell **extension** that runs inside the privileged
 //! gnome-shell process and exports its own D-Bus interface. The helper bundles
 //! that extension (embedded in this binary via `include_str!`), installs it into
-//! `~/.local/share/gnome-shell/extensions/<uuid>/`, disables version validation,
-//! and enables it. The extension exports:
+//! `~/.local/share/gnome-shell/extensions/<uuid>/` and enables it (disabling the
+//! shell-wide version validation only on a shell its metadata does not list).
+//! The extension exports:
 //!
 //!   * bus name : `org.wispr.flow.WindowBridge`
 //!   * object   : `/org/wispr/flow/WindowBridge`
@@ -107,6 +108,11 @@ impl Shared {
     fn set_focus_detection(&self, active: bool) {
         self.focus_active.store(active, Ordering::Relaxed);
         if active {
+            // Re-enabling must re-announce even an unchanged app (see
+            // RecordingStarted in main.rs), so forget the dedup key first.
+            if let Ok(mut last) = self.last_emitted.lock() {
+                *last = None;
+            }
             // Push the current focus immediately so a fresh subscriber gets state
             // without waiting for the next FocusChanged.
             let current = self.cache.lock().ok().and_then(|g| g.clone());
@@ -143,10 +149,10 @@ impl GnomeTracker {
         if let Err(e) = ensure_installed() {
             log::warn!("gnome bridge: extension install failed: {e}");
         }
-        ensure_enabled();
 
         let conn =
             zbus::blocking::Connection::session().map_err(|e| format!("session bus: {e}"))?;
+        ensure_enabled(&conn);
 
         // (2) Probe: is the extension's D-Bus interface live in the shell?
         let proxy = make_proxy(&conn)?;
@@ -170,11 +176,17 @@ impl GnomeTracker {
         let shared = Arc::new(Shared {
             cache: Mutex::new(initial),
             events,
-            focus_active: AtomicBool::new(false),
+            focus_active: AtomicBool::new(true),
             last_emitted: Mutex::new(None),
             counter: AtomicU64::new(0),
             pid,
         });
+
+        // Push the startup seed so Electron knows the focused app before the
+        // first focus change (it only learns the app from these events).
+        if let Some(app) = shared.cache.lock().ok().and_then(|g| g.clone()) {
+            shared.emit(&app);
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -218,6 +230,10 @@ impl GnomeTracker {
 
     /// Enable/disable `AppInfoUpdate` focus events.
     pub fn set_focus_detection(&self, active: bool) {
+        if active {
+            // Refresh the cache from the shell so the announcement is current.
+            let _ = self.current();
+        }
         self.shared.set_focus_detection(active);
     }
 
@@ -340,24 +356,82 @@ fn ensure_installed() -> Result<bool, String> {
     Ok(true)
 }
 
-/// Disable GNOME's per-version extension validation (so our broad
-/// `shell-version` list loads across releases) and enable the extension.
+/// Enable the extension, disabling GNOME's per-version extension validation
+/// only when the running shell is missing from our `shell-version` list.
 /// Best-effort: logs but never fails (the probe in `start()` is the real gate).
-fn ensure_enabled() {
-    // disable-extension-version-validation: load even if shell-version doesn't
-    // exactly match (we keep a broad list, but this is the belt-and-braces step).
-    run_ok(
-        "gsettings",
-        &[
-            "set",
-            "org.gnome.shell",
-            "disable-extension-version-validation",
-            "true",
-        ],
-    );
+fn ensure_enabled(conn: &zbus::blocking::Connection) {
+    // disable-extension-version-validation is a shell-wide setting: it lets
+    // EVERY installed extension load on shell versions it never declared, and
+    // nothing turns it back on. Our metadata already lists the supported
+    // releases, so flip it only for a shell we can identify as newer than that
+    // list. A shell we cannot identify (e.g. not on the bus yet at login) is
+    // left alone: the next start retries, and a listed shell loads us anyway.
+    let Some(shell) = shell_major_version(conn) else {
+        log::debug!("gnome bridge: shell version unknown; leaving version validation alone");
+        run_ok("gnome-extensions", &["enable", EXT_UUID]);
+        return;
+    };
+    if needs_validation_override(&shell, EXT_METADATA) {
+        log::warn!(
+            "gnome bridge: GNOME Shell {shell} is not in the extension's shell-version list; \
+             disabling extension version validation so the bridge can load"
+        );
+        run_ok(
+            "gsettings",
+            &[
+                "set",
+                "org.gnome.shell",
+                "disable-extension-version-validation",
+                "true",
+            ],
+        );
+    }
     // Enable via the gnome-extensions CLI (which talks to the shell's
     // org.gnome.Shell.Extensions D-Bus service under the hood).
     run_ok("gnome-extensions", &["enable", EXT_UUID]);
+}
+
+/// The RUNNING shell's major version, from its `ShellVersion` D-Bus property.
+/// Asking the live shell (not `gnome-shell --version` on disk) matters after an
+/// upgrade without relogin, when the binary and the loaded shell differ; it
+/// also spawns nothing.
+fn shell_major_version(conn: &zbus::blocking::Connection) -> Option<String> {
+    // One property read: no property cache (it would GetAll and add a match rule).
+    let proxy: zbus::blocking::Proxy<'_> = zbus::blocking::proxy::Builder::new(conn)
+        .destination("org.gnome.Shell")
+        .ok()?
+        .path("/org/gnome/Shell")
+        .ok()?
+        .interface("org.gnome.Shell")
+        .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .ok()?;
+    let version: String = proxy
+        .get_property("ShellVersion")
+        .map_err(|e| log::debug!("gnome bridge: ShellVersion unavailable: {e}"))
+        .ok()?;
+    parse_shell_major(&version)
+}
+
+/// "50.1" -> "50"; also takes pre-releases like "51.alpha".
+fn parse_shell_major(version: &str) -> Option<String> {
+    let major = version.trim().split('.').next()?;
+    (!major.is_empty() && major.bytes().all(|b| b.is_ascii_digit())).then(|| major.to_string())
+}
+
+/// Whether validation must be disabled for the bridge to load: true when the
+/// shell's major version is absent from the metadata's `shell-version` list
+/// (or the metadata has no usable list, which the shell would reject too).
+fn needs_validation_override(major: &str, metadata: &str) -> bool {
+    let Ok(meta) = serde_json::from_str::<Value>(metadata) else {
+        return true;
+    };
+    let listed = meta
+        .get("shell-version")
+        .and_then(Value::as_array)
+        .is_some_and(|versions| versions.iter().any(|v| v.as_str() == Some(major)));
+    !listed
 }
 
 /// Run a command, logging the outcome. Never panics; missing binaries are just
@@ -485,4 +559,44 @@ fn window_to_app(v: &Value) -> ActiveApp {
 fn short_name(app_id: &str) -> String {
     let base = app_id.strip_suffix(".desktop").unwrap_or(app_id);
     base.rsplit('.').next().unwrap_or(base).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_shell_major_version() {
+        assert_eq!(parse_shell_major("50.1").as_deref(), Some("50"));
+        assert_eq!(parse_shell_major("51.alpha").as_deref(), Some("51"));
+        assert_eq!(parse_shell_major("45").as_deref(), Some("45"));
+        assert_eq!(parse_shell_major(" 49.0 ").as_deref(), Some("49"));
+        assert_eq!(parse_shell_major(""), None);
+        assert_eq!(parse_shell_major(".1"), None);
+        assert_eq!(parse_shell_major("GNOME Shell 50.1"), None);
+    }
+
+    /// The shell-wide validation switch is only touched when the bundled
+    /// metadata cannot load on the running shell. 50 is the shell this was
+    /// validated on, so the bundled list must keep it.
+    #[test]
+    fn overrides_validation_only_for_unlisted_shells() {
+        assert!(!needs_validation_override("50", EXT_METADATA));
+        assert!(!needs_validation_override("45", EXT_METADATA));
+        assert!(needs_validation_override("99", EXT_METADATA));
+    }
+
+    /// Metadata the shell could not match against (not JSON, no list, a
+    /// non-array list, non-string entries) still needs the override.
+    #[test]
+    fn overrides_validation_without_a_usable_version_list() {
+        assert!(needs_validation_override("50", "not json"));
+        assert!(needs_validation_override("50", r#"{"uuid":"x"}"#));
+        assert!(needs_validation_override("50", r#"{"shell-version":"50"}"#));
+        assert!(needs_validation_override("50", r#"{"shell-version":[50]}"#));
+        assert!(!needs_validation_override(
+            "50",
+            r#"{"shell-version":["49","50"]}"#
+        ));
+    }
 }
