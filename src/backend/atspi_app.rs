@@ -119,6 +119,11 @@ impl Shared {
     fn set_focus_detection(&self, active: bool) {
         self.focus_active.store(active, Ordering::Relaxed);
         if active {
+            // Re-enabling must re-announce even an unchanged app (see
+            // RecordingStarted in main.rs), so forget the dedup key first.
+            if let Ok(mut last) = self.last_emitted.lock() {
+                *last = None;
+            }
             // Push the current focus immediately so a fresh subscriber gets state
             // without waiting for the next focus change.
             let current = self.cache.lock().ok().and_then(|g| g.clone());
@@ -167,7 +172,7 @@ impl AtspiTracker {
         let shared = Arc::new(Shared {
             cache: Mutex::new(seed),
             events,
-            focus_active: AtomicBool::new(false),
+            focus_active: AtomicBool::new(true),
             last_emitted: Mutex::new(None),
             counter: AtomicU64::new(0),
             pid,

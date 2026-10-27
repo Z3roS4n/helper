@@ -3,7 +3,8 @@
 //! Confident/implemented:
 //!   * GetActiveAppInfo  — `_NET_ACTIVE_WINDOW` -> `_NET_WM_PID` (/proc) + `_NET_WM_NAME` + `WM_CLASS`
 //!   * GetRunningApps    — `_NET_CLIENT_LIST` -> per-window `WM_CLASS` / `_NET_WM_NAME`
-//!   * SimulateKeyPress  — VK -> keysym (keymap.rs) -> keycode (server mapping) -> XTEST
+//!   * SimulateKeyPress  — VK -> keysym (keymap.rs) -> keycode (server mapping, active
+//!     XKB group first) -> XTEST
 //!   * PasteText         — set clipboard + synth Ctrl+V (Ctrl+V via XTEST)
 //!   * GetSelectedText   — copy-probe: save clipboard, Ctrl+C, read, restore (approximate)
 //!
@@ -34,8 +35,8 @@ pub struct X11Backend {
     conn: RustConnection,
     root: Window,
     atoms: Atoms,
-    /// keysym -> X keycode, built once from the server keyboard mapping.
-    keysym_to_keycode: std::collections::HashMap<u32, u8>,
+    /// Server keyboard mapping, fetched once at connect.
+    keyboard: KeyboardMapping,
     has_xclip: bool,
     has_xsel: bool,
 }
@@ -75,7 +76,7 @@ impl X11Backend {
             wm_class: intern(b"WM_CLASS")?,
         };
 
-        let keysym_to_keycode = build_keysym_map(&conn)?;
+        let keyboard = fetch_keyboard_mapping(&conn)?;
         let has_xclip = which("xclip");
         let has_xsel = which("xsel");
         if !has_xclip && !has_xsel {
@@ -86,7 +87,7 @@ impl X11Backend {
             conn,
             root,
             atoms,
-            keysym_to_keycode,
+            keyboard,
             has_xclip,
             has_xsel,
         })
@@ -155,10 +156,20 @@ impl X11Backend {
 
     fn keycode_for_vk(&self, vk: u32) -> Result<u8> {
         let keysym = keymap::vk_to_keysym(vk).ok_or_else(|| format!("unmapped VK {vk}"))?;
-        self.keysym_to_keycode
-            .get(&keysym)
-            .copied()
+        self.keyboard
+            .keycode_for(keysym, self.active_group())
             .ok_or_else(|| format!("no keycode for keysym {keysym:#x} (VK {vk})"))
+    }
+
+    /// Effective XKB group (0-3), read from bits 13-14 of the core keyboard state.
+    /// Falls back to group 0 if the query fails.
+    fn active_group(&self) -> usize {
+        self.conn
+            .query_pointer(self.root)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| ((u16::from(reply.mask) >> 13) & 0x3) as usize)
+            .unwrap_or(0)
     }
 
     fn fake_key(&self, keycode: u8, press: bool) -> Result<()> {
@@ -177,17 +188,15 @@ impl X11Backend {
 
     /// Press a chord: hold modifiers, tap the key, release everything (reverse order).
     fn press_chord(&self, key_keysym: u32, mod_keysyms: &[u32]) -> Result<()> {
+        let group = self.active_group();
         let key_kc = self
-            .keysym_to_keycode
-            .get(&key_keysym)
-            .copied()
+            .keyboard
+            .keycode_for(key_keysym, group)
             .ok_or_else(|| format!("no keycode for keysym {key_keysym:#x}"))?;
-        let mut mod_kcs = Vec::new();
-        for ks in mod_keysyms {
-            if let Some(kc) = self.keysym_to_keycode.get(ks) {
-                mod_kcs.push(*kc);
-            }
-        }
+        let mod_kcs: Vec<u8> = mod_keysyms
+            .iter()
+            .filter_map(|&ks| self.keyboard.keycode_for(ks, group))
+            .collect();
         // TODO: snapshot & release physically-held modifiers first (XQueryKeymap),
         // restore after — mirrors the Windows helper's GetKeyState dance.
         for kc in &mod_kcs {
@@ -349,8 +358,45 @@ impl Backend for X11Backend {
     }
 }
 
-/// Build keysym -> keycode from the server keyboard mapping (first matching keycode wins).
-fn build_keysym_map(conn: &RustConnection) -> Result<std::collections::HashMap<u32, u8>> {
+/// Core-protocol keyboard mapping: `per` keysyms for each keycode from `min_keycode`.
+/// Columns 2g and 2g+1 hold levels 1-2 of XKB group g for groups 0 and 1.
+struct KeyboardMapping {
+    min_keycode: u8,
+    per: usize,
+    keysyms: Vec<u32>,
+}
+
+impl KeyboardMapping {
+    /// Keycode that types `keysym` in `group`, falling back to the first keycode that
+    /// carries it in any column. Without the group pass, a multi-layout map (GNOME
+    /// always appends `us`, e.g. `us(dvorak),us`) resolves `v` to the QWERTY V
+    /// keycode, which types `k` in Dvorak, so Ctrl+V lands as Ctrl+K.
+    fn keycode_for(&self, keysym: u32, group: usize) -> Option<u8> {
+        if keysym == 0 || self.per == 0 {
+            return None;
+        }
+        let find = |cols: std::ops::Range<usize>| {
+            self.keysyms
+                .chunks(self.per)
+                .position(|syms| {
+                    syms.iter()
+                        .take(cols.end)
+                        .skip(cols.start)
+                        .any(|&s| s == keysym)
+                })
+                .map(|i| self.min_keycode + i as u8)
+        };
+        // Core columns 4+ interleave higher levels with groups 3-4; only 0 and 1 are reliable.
+        let group_cols = if group < 2 {
+            2 * group..2 * group + 2
+        } else {
+            0..0
+        };
+        find(group_cols).or_else(|| find(0..self.per))
+    }
+}
+
+fn fetch_keyboard_mapping(conn: &RustConnection) -> Result<KeyboardMapping> {
     let setup = conn.setup();
     let min = setup.min_keycode;
     let max = setup.max_keycode;
@@ -360,20 +406,11 @@ fn build_keysym_map(conn: &RustConnection) -> Result<std::collections::HashMap<u
         .map_err(|e| format!("get_keyboard_mapping: {e}"))?
         .reply()
         .map_err(|e| format!("get_keyboard_mapping reply: {e}"))?;
-    let per = mapping.keysyms_per_keycode as usize;
-    let mut map = std::collections::HashMap::new();
-    if per == 0 {
-        return Ok(map);
-    }
-    for (i, chunk) in mapping.keysyms.chunks(per).enumerate() {
-        let keycode = min + i as u8;
-        for &ks in chunk {
-            if ks != 0 {
-                map.entry(ks).or_insert(keycode);
-            }
-        }
-    }
-    Ok(map)
+    Ok(KeyboardMapping {
+        min_keycode: min,
+        per: mapping.keysyms_per_keycode as usize,
+        keysyms: mapping.keysyms,
+    })
 }
 
 fn which(prog: &str) -> bool {
@@ -411,4 +448,84 @@ fn run_capture(prog: &str, args: &[&str]) -> Result<String> {
         .output()
         .map_err(|e| format!("spawn {prog}: {e}"))?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const XK_K_LOWER: u32 = 0x6b;
+    const XK_K_UPPER: u32 = 0x4b;
+    const XK_V_LOWER: u32 = 0x76;
+    const XK_V_UPPER: u32 = 0x56;
+    const XK_PERIOD: u32 = 0x2e;
+    const XK_GREATER: u32 = 0x3e;
+    const XK_CYRILLIC_EM: u32 = 0x6cd;
+    const XK_CYRILLIC_EM_UPPER: u32 = 0x6ed;
+
+    /// Mapping with 4 keysyms per keycode (two groups), min keycode 8, and the
+    /// given keycodes filled in; every other keycode is NoSymbol.
+    fn mapping(keys: &[(u8, [u32; 4])]) -> KeyboardMapping {
+        let min_keycode = 8u8;
+        let per = 4;
+        let mut keysyms = vec![0u32; (255 - min_keycode as usize + 1) * per];
+        for (keycode, syms) in keys {
+            let start = (*keycode - min_keycode) as usize * per;
+            keysyms[start..start + per].copy_from_slice(syms);
+        }
+        KeyboardMapping {
+            min_keycode,
+            per,
+            keysyms,
+        }
+    }
+
+    /// `us(dvorak),us` — what GNOME applies for a lone Dvorak input source.
+    fn dvorak_with_us() -> KeyboardMapping {
+        mapping(&[
+            (55, [XK_K_LOWER, XK_K_UPPER, XK_V_LOWER, XK_V_UPPER]),
+            (60, [XK_V_LOWER, XK_V_UPPER, XK_PERIOD, XK_GREATER]),
+        ])
+    }
+
+    /// Ctrl+V must use the key that types `v` in the active layout, not the first
+    /// keycode carrying `v` in any group (keycode 55 types `k` in Dvorak).
+    #[test]
+    fn active_group_wins_over_lower_keycode() {
+        let map = dvorak_with_us();
+        assert_eq!(map.keycode_for(XK_V_LOWER, 0), Some(60));
+        assert_eq!(map.keycode_for(XK_K_LOWER, 0), Some(55));
+    }
+
+    #[test]
+    fn second_group_active() {
+        let map = dvorak_with_us();
+        assert_eq!(map.keycode_for(XK_V_LOWER, 1), Some(55));
+        assert_eq!(map.keycode_for(XK_PERIOD, 1), Some(60));
+    }
+
+    /// Non-Latin active layout: `v` exists only in the appended `us` group, so the
+    /// lookup falls back to it (toolkits resolve Ctrl+V via that Latin group).
+    #[test]
+    fn falls_back_to_any_group() {
+        let map = mapping(&[(
+            55,
+            [XK_CYRILLIC_EM, XK_CYRILLIC_EM_UPPER, XK_V_LOWER, XK_V_UPPER],
+        )]);
+        assert_eq!(map.keycode_for(XK_V_LOWER, 0), Some(55));
+    }
+
+    /// Groups 3-4 have no fixed core columns, so they use the any-column fallback.
+    #[test]
+    fn high_group_uses_fallback() {
+        let map = dvorak_with_us();
+        assert_eq!(map.keycode_for(XK_V_LOWER, 2), Some(55));
+    }
+
+    #[test]
+    fn missing_keysym() {
+        let map = dvorak_with_us();
+        assert_eq!(map.keycode_for(XK_CYRILLIC_EM, 0), None);
+        assert_eq!(map.keycode_for(0, 0), None);
+    }
 }
