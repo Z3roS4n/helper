@@ -107,6 +107,11 @@ impl Shared {
     fn set_focus_detection(&self, active: bool) {
         self.focus_active.store(active, Ordering::Relaxed);
         if active {
+            // Re-enabling must re-announce even an unchanged app (see
+            // RecordingStarted in main.rs), so forget the dedup key first.
+            if let Ok(mut last) = self.last_emitted.lock() {
+                *last = None;
+            }
             // Push the current focus immediately so a fresh subscriber gets state
             // without waiting for the next FocusChanged.
             let current = self.cache.lock().ok().and_then(|g| g.clone());
@@ -170,11 +175,17 @@ impl GnomeTracker {
         let shared = Arc::new(Shared {
             cache: Mutex::new(initial),
             events,
-            focus_active: AtomicBool::new(false),
+            focus_active: AtomicBool::new(true),
             last_emitted: Mutex::new(None),
             counter: AtomicU64::new(0),
             pid,
         });
+
+        // Push the startup seed so Electron knows the focused app before the
+        // first focus change (it only learns the app from these events).
+        if let Some(app) = shared.cache.lock().ok().and_then(|g| g.clone()) {
+            shared.emit(&app);
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -218,6 +229,10 @@ impl GnomeTracker {
 
     /// Enable/disable `AppInfoUpdate` focus events.
     pub fn set_focus_detection(&self, active: bool) {
+        if active {
+            // Refresh the cache from the shell so the announcement is current.
+            let _ = self.current();
+        }
         self.shared.set_focus_detection(active);
     }
 

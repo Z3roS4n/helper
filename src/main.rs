@@ -276,6 +276,13 @@ fn handle_request(
         }
 
         // ---- lifecycle ----
+        // Electron resets the dictation's app at every start and refills it
+        // only from an AppInfoUpdate that arrives while the dictation is
+        // running, so re-announce the focused app even if it has not changed.
+        "RecordingStarted" => {
+            be.set_focus_detection(true);
+            ipc.send(&proto::ack(uuid));
+        }
         "HelperAppShutdown" => {
             log::info!("HelperAppShutdown received — exiting");
             ipc.send(&proto::ack(uuid));
