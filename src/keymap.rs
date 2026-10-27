@@ -380,6 +380,12 @@ pub fn evdev_to_vk(code: u16) -> Option<u32> {
         192 => 133, // f22
         193 => 134, // f23
         194 => 135, // f24
+        // Mouse buttons, as the app's keycode constants encode them
+        // (mouse_middle 4098, mouse4 4099, mouse5 4100). BTN_SIDE/BTN_EXTRA are
+        // the back/forward thumb buttons that Chromium reports as buttons 3/4.
+        0x112 => 4098, // BTN_MIDDLE
+        0x113 => 4099, // BTN_SIDE (mouse 4, back)
+        0x114 => 4100, // BTN_EXTRA (mouse 5, forward)
         _ => return None,
     })
 }
@@ -425,5 +431,16 @@ mod tests {
         assert_eq!(evdev_to_vk(42), Some(160)); // left shift
         assert_eq!(evdev_to_vk(56), Some(164)); // left alt
         assert_eq!(evdev_to_vk(125), Some(91)); // left meta (win)
+    }
+
+    /// Mouse buttons use the app's mouse keycodes; left/right click stay unmapped
+    /// so ordinary clicking never reaches the keyboard service.
+    #[test]
+    fn mouse_buttons_map_to_app_mouse_codes() {
+        assert_eq!(evdev_to_vk(0x112), Some(4098)); // middle
+        assert_eq!(evdev_to_vk(0x113), Some(4099)); // mouse 4
+        assert_eq!(evdev_to_vk(0x114), Some(4100)); // mouse 5
+        assert_eq!(evdev_to_vk(0x110), None); // left
+        assert_eq!(evdev_to_vk(0x111), None); // right
     }
 }

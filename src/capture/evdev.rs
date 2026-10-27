@@ -37,6 +37,10 @@ const KEY_RELEASE: i32 = 0;
 // (which carry BTN_* codes but not letter keys).
 const KEY_A: u16 = 30;
 const KEY_Z: u16 = 44;
+// Mouse thumb buttons: a pointer device with either is watched too, so they
+// can be bound as shortcuts (Mouse 4/5 push-to-talk).
+const BTN_SIDE: u16 = 0x113;
+const BTN_EXTRA: u16 = 0x114;
 
 // Widest keycode we map; a (KEY_MAX/8 + 1)-byte bitmap covers every code.
 const KEY_MAX: usize = 0x2ff;
@@ -73,14 +77,17 @@ fn is_event_node(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with("event"))
 }
 
-/// True if the open device advertises ordinary keyboard keys (KEY_A..KEY_Z),
-/// which filters out mice, touchpads, and other non-keyboard event nodes.
+/// True if the open device advertises ordinary keyboard keys (KEY_A..KEY_Z) or
+/// mouse thumb buttons, which filters out touchpads, plain two/three-button
+/// mice, and other event nodes with nothing the app can bind.
 fn is_keyboard(fd: libc::c_int) -> bool {
     let mut bitmap = [0u8; BITMAP_LEN];
     if unsafe { libc::ioctl(fd, eviocgbit_key(), bitmap.as_mut_ptr()) } < 0 {
         return false;
     }
-    bit_set(&bitmap, KEY_A) && bit_set(&bitmap, KEY_Z)
+    (bit_set(&bitmap, KEY_A) && bit_set(&bitmap, KEY_Z))
+        || bit_set(&bitmap, BTN_SIDE)
+        || bit_set(&bitmap, BTN_EXTRA)
 }
 
 /// The device's name (`EVIOCGNAME`), or `None` if the ioctl fails.
