@@ -38,6 +38,11 @@ const UI_SET_EVBIT: libc::c_ulong = 0x40045564;
 const UI_SET_KEYBIT: libc::c_ulong = 0x40045565;
 
 const BUS_USB: u16 = 0x03;
+
+/// Name of the virtual keyboard we create. Key capture matches on it to skip
+/// our own device, which would otherwise echo every injected key back to the
+/// app as a keypress.
+pub const DEVICE_NAME: &str = "Wispr Flow Linux Helper";
 /// We enable the full standard key range so any mapped VK can be injected.
 const KEY_MAX: u16 = 0x2ff;
 
@@ -77,8 +82,7 @@ impl UInput {
         // Legacy device-setup path (write a uinput_user_dev, then UI_DEV_CREATE):
         // widely supported and avoids the newer UI_DEV_SETUP/abs_setup structs.
         let mut dev: libc::uinput_user_dev = unsafe { std::mem::zeroed() };
-        let name = b"Wispr Flow Linux Helper";
-        for (i, &b) in name.iter().enumerate() {
+        for (i, &b) in DEVICE_NAME.as_bytes().iter().enumerate() {
             dev.name[i] = b as libc::c_char;
         }
         dev.id.bustype = BUS_USB;
