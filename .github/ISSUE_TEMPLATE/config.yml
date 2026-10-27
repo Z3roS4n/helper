@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Wispr Flow for Linux bug or feature request
+    url: https://github.com/wispr-flow-linux/wispr-flow-linux/issues/new/choose
+    about: |
+      User-facing bugs go to the main repo with `wispr-flow --doctor` output,
+      even when the fix lands here. Use a blank issue here only for code-level
+      work on this repo.
+  - name: Wispr Flow app bugs / account / billing
+    url: https://wisprflow.ai
+    about: Bugs in the Wispr Flow application itself are upstream.
